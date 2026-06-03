@@ -19,6 +19,7 @@ target_include_directories(pico_emb PRIVATE
 target_link_libraries(${PROJECT_NAME}
     pico_stdlib
     hardware_adc
+    hardware_dma
     hardware_pwm
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4

@@ -20,10 +20,13 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
+#include "hardware/dma.h"
 #include "hardware/pwm.h"
+#include "hardware/irq.h"
+#include "hardware/clocks.h"
+#include "hardware/structs/adc.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "queue.h"
 
 #define PIN_BTN   14
 #define PIN_LED    4
@@ -32,13 +35,54 @@
 #define ADC_CHAN   1
 
 #define SAMPLE_RATE_HZ   16000
-#define SAMPLE_PERIOD_US (1000000 / SAMPLE_RATE_HZ)   // 62.5us
-#define PWM_WRAP         4095   // 12-bit
-#define PWM_MID          2048   // silêncio (ponto médio)
+#define PWM_WRAP         4095   // espaço de 12-bit das amostras (0..4095)
+#define PWM_MID          2048   // silêncio (ponto médio do 12-bit)
 
-static QueueHandle_t xQueueSpkSamples;
+// ADC roda a 48 MHz. Período de amostra = (1 + clkdiv) ciclos.
+// 48e6 / 16000 = 3000 ciclos por amostra  ->  clkdiv = 2999  ->  16 kHz exatos.
+#define ADC_CLKDIV       2999.0f
+
+// Captura por DMA em ping-pong: o hardware do ADC gera amostras a 16 kHz e o DMA
+// drena a FIFO pra RAM sem CPU. Cada buffer = MIC_CHUNK amostras (~16 ms @ 16 kHz).
+#define MIC_CHUNK        256
+
+// --- Reprodução no speaker (estilo pico-pwm-audio: ISR do PWM, sem busy_wait) ---
+// Portadora a 48 kHz (inaudível, filtrável no RC). A ISR do wrap alimenta uma
+// amostra a cada SPK_DECIM wraps -> 16 kHz exatos. Igual ao truque do exemplo
+// de repetir a amostra pra separar a portadora da taxa de amostragem.
+#define SPK_CARRIER_HZ   48000
+#define SPK_DECIM        3              // 48 kHz / 3 = 16 kHz (taxa de amostra)
+#define SPK_WRAP         3124          // 3125 níveis (~11.6 bit); 150MHz/3125 = 48kHz
+#define SPK_SILENCE      (SPK_WRAP / 2)
+
+// Ring buffer SPSC: usb_rx_task (produtor) enche, a ISR do PWM (consumidor) drena.
+#define SPK_RING_SIZE    8192          // potência de 2; ~0.5 s @ 16 kHz
+#define SPK_RING_MASK    (SPK_RING_SIZE - 1)
+
 static volatile bool recording = false;
 static volatile bool playing   = false;
+
+// --- Captura do microfone via DMA ---
+static uint16_t mic_buf[2][MIC_CHUNK];   // ping-pong
+static int      mic_dma_chan;
+static volatile int  mic_cur        = 0; // buffer que o DMA está enchendo agora
+static volatile int  mic_filled_buf = -1;// buffer pronto pra enviar (-1 = nenhum)
+static volatile bool mic_overflow   = false;
+
+// --- Reprodução no speaker ---
+static uint16_t spk_ring[SPK_RING_SIZE];
+static volatile uint32_t spk_head = 0;   // total de amostras escritas (produtor)
+static volatile uint32_t spk_tail = 0;   // total de amostras lidas (consumidor/ISR)
+static uint spk_slice, spk_chan;
+
+// Produtor: empilha uma amostra (12-bit, 0..4095). Descarta se o ring estiver cheio.
+static inline void spk_ring_push(uint16_t s) {
+    if (spk_head - spk_tail < SPK_RING_SIZE) {
+        spk_ring[spk_head & SPK_RING_MASK] = s;
+        __asm volatile ("" ::: "memory");   // garante o dado antes de avançar head
+        spk_head++;
+    }
+}
 
 static void button_task(void *params) {
     (void) params;
@@ -65,15 +109,16 @@ static void button_task(void *params) {
                 if (stable_count == STABLE_NEEDED && raw != stable_state) {
                     stable_state = raw;
                     if (stable_state) {
-                        recording = true;
                         gpio_put(PIN_LED, 1);
                         fwrite("<<S>", 1, 4, stdout);
+                        fflush(stdout);
+                        recording = true;   // só depois do marcador sair
                     } else {
-                        recording = false;
+                        recording = false;  // mic para de empurrar amostras
                         gpio_put(PIN_LED, 0);
                         fwrite("<<E>", 1, 4, stdout);
+                        fflush(stdout);
                     }
-                    fflush(stdout);
                 }
             }
         } else {
@@ -85,46 +130,151 @@ static void button_task(void *params) {
     }
 }
 
+// ISR de fim de transferência do DMA. Reinicia o DMA no outro buffer
+// imediatamente (ping-pong, sem buraco de amostragem) e marca qual buffer ficou
+// pronto. Não chama nenhuma API do FreeRTOS — só toca em registradores e flags
+// volatile — então é seguro independente da prioridade do IRQ.
+static void mic_dma_isr(void) {
+    if (dma_hw->ints0 & (1u << mic_dma_chan)) {
+        dma_hw->ints0 = (1u << mic_dma_chan);   // limpa o IRQ
+
+        int filled = mic_cur;
+        mic_cur ^= 1;
+
+        // Reaponta e redispara o DMA no outro buffer. A FIFO (4 níveis) cobre os
+        // poucos ciclos entre o fim e o redisparo, então nenhuma amostra é perdida.
+        dma_channel_set_write_addr(mic_dma_chan, mic_buf[mic_cur], false);
+        dma_channel_set_trans_count(mic_dma_chan, MIC_CHUNK, true);
+
+        // Se a task ainda não consumiu o buffer anterior, registra overflow.
+        if (mic_filled_buf != -1) mic_overflow = true;
+        mic_filled_buf = filled;
+    }
+}
+
+static void mic_dma_start(void) {
+    mic_cur = 0;
+    mic_filled_buf = -1;
+    adc_fifo_drain();
+    dma_channel_set_write_addr(mic_dma_chan, mic_buf[mic_cur], false);
+    dma_channel_set_irq0_enabled(mic_dma_chan, true);
+    dma_channel_set_trans_count(mic_dma_chan, MIC_CHUNK, true);  // dispara
+    adc_run(true);
+}
+
+static void mic_dma_stop(void) {
+    adc_run(false);
+    // Desabilita o IRQ deste canal antes do abort: o abort pode deixar um IRQ
+    // pendente que reativaria o ping-pong indevidamente.
+    dma_channel_set_irq0_enabled(mic_dma_chan, false);
+    dma_channel_abort(mic_dma_chan);
+    dma_hw->ints0 = (1u << mic_dma_chan);   // limpa pendência residual
+    adc_fifo_drain();
+    mic_filled_buf = -1;
+}
+
 static void mic_task(void *params) {
     (void) params;
 
+    // ADC em modo free-running, clock de hardware a 16 kHz, FIFO + DMA.
     adc_init();
     adc_gpio_init(PIN_MIC);
     adc_select_input(ADC_CHAN);
+    adc_fifo_setup(
+        true,    // habilita FIFO
+        true,    // gera DREQ (pedido de DMA)
+        1,       // DREQ quando >= 1 amostra na FIFO
+        false,   // sem bit de erro na FIFO
+        false    // mantém 12-bit (não reduz pra 8-bit)
+    );
+    adc_set_clkdiv(ADC_CLKDIV);   // 16 kHz exatos
+
+    // Canal de DMA: lê da FIFO do ADC (endereço fixo) e escreve no buffer (incrementa).
+    mic_dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(mic_dma_chan);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_16);
+    channel_config_set_read_increment(&c, false);
+    channel_config_set_write_increment(&c, true);
+    channel_config_set_dreq(&c, DREQ_ADC);
+    dma_channel_configure(mic_dma_chan, &c, mic_buf[0], &adc_hw->fifo, MIC_CHUNK, false);
+
+    // IRQ de fim de transferência -> reinicia ping-pong na ISR.
+    dma_channel_set_irq0_enabled(mic_dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, mic_dma_isr);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    bool was_recording = false;
 
     while (true) {
         if (recording) {
-            uint16_t raw = adc_read();  // 12-bit, 0..4095
-            // Envia 2 bytes em little-endian
-            putchar(raw & 0xFF);
-            putchar((raw >> 8) & 0xFF);
-            busy_wait_us(SAMPLE_PERIOD_US);
+            if (!was_recording) {
+                mic_overflow = false;
+                mic_dma_start();
+                was_recording = true;
+            }
+
+            int b = mic_filled_buf;
+            if (b >= 0) {
+                // Envio em bloco (não byte-a-byte): little-endian nativo do ARM,
+                // exatamente o formato <u2 que o bridge.py espera.
+                fwrite(mic_buf[b], sizeof(uint16_t), MIC_CHUNK, stdout);
+                fflush(stdout);
+                mic_filled_buf = -1;
+            } else {
+                // DMA ainda enchendo o buffer (~16 ms); cede CPU pras outras tasks.
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
         } else {
-            fflush(stdout);
+            if (was_recording) {
+                mic_dma_stop();
+                was_recording = false;
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
 }
 
-static void spk_task(void *params) {
-    (void) params;
+// ISR do wrap do PWM — paga pelo hardware a cada ciclo da portadora (48 kHz).
+// A cada SPK_DECIM ciclos puxa a próxima amostra do ring (16 kHz) e ajusta o
+// duty. Sem busy_wait, sem fila no caminho crítico -> reprodução sem jitter.
+// Fica na RAM (__not_in_flash_func) pra não tomar latência de XIP.
+static void __not_in_flash_func(spk_pwm_isr)(void) {
+    pwm_clear_irq(spk_slice);
 
-    gpio_set_function(PIN_SPK, GPIO_FUNC_PWM);
-    uint slice = pwm_gpio_to_slice_num(PIN_SPK);
-    uint chan  = pwm_gpio_to_channel(PIN_SPK);
+    static int decim = 0;
+    if (++decim < SPK_DECIM) return;
+    decim = 0;
 
-    pwm_set_wrap(slice, PWM_WRAP);
-    pwm_set_clkdiv(slice, 1.0f);   // ~30.5 kHz com wrap 4095 (sysclk 125MHz)
-    pwm_set_chan_level(slice, chan, PWM_MID);
-    pwm_set_enabled(slice, true);
-
-    uint16_t sample;
-    while (true) {
-        if (xQueueReceive(xQueueSpkSamples, &sample, portMAX_DELAY) == pdTRUE) {
-            pwm_set_chan_level(slice, chan, sample);
-            busy_wait_us(SAMPLE_PERIOD_US);
-        }
+    uint16_t level = SPK_SILENCE;
+    if (spk_head != spk_tail) {                       // ring não vazio
+        uint16_t s = spk_ring[spk_tail & SPK_RING_MASK];
+        spk_tail++;
+        // mapeia 12-bit (0..4095) -> 0..SPK_WRAP
+        level = (uint16_t)(((uint32_t) s * (SPK_WRAP + 1)) >> 12);
+        if (level > SPK_WRAP) level = SPK_WRAP;
     }
+    pwm_set_chan_level(spk_slice, spk_chan, level);
+}
+
+static void spk_audio_init(void) {
+    gpio_set_function(PIN_SPK, GPIO_FUNC_PWM);
+    spk_slice = pwm_gpio_to_slice_num(PIN_SPK);
+    spk_chan  = pwm_gpio_to_channel(PIN_SPK);
+
+    pwm_clear_irq(spk_slice);
+    pwm_set_irq_enabled(spk_slice, true);
+    irq_set_exclusive_handler(PWM_IRQ_WRAP, spk_pwm_isr);
+    irq_set_enabled(PWM_IRQ_WRAP, true);
+
+    // clkdiv tal que (wrap+1)*clkdiv = sysclk/48kHz. Com sysclk=150MHz -> clkdiv=1.0.
+    float clkdiv = (float) clock_get_hz(clk_sys) / ((float) SPK_CARRIER_HZ * (SPK_WRAP + 1));
+
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv(&config, clkdiv);
+    pwm_config_set_wrap(&config, SPK_WRAP);
+    pwm_init(spk_slice, &config, true);
+
+    pwm_set_chan_level(spk_slice, spk_chan, SPK_SILENCE);
 }
 
 static void usb_rx_task(void *params) {
@@ -159,8 +309,8 @@ static void usb_rx_task(void *params) {
         } else if (is_end) {
             playing = false;
             have_lsb = false;
-            uint16_t silence = PWM_MID;
-            xQueueSend(xQueueSpkSamples, &silence, 0);
+            // Sem empurrar silêncio: quando o ring esvazia, a ISR já volta sozinha
+            // pro nível de silêncio (SPK_SILENCE).
         } else if (playing) {
             // Remonta sample de 2 bytes em little-endian
             if (!have_lsb) {
@@ -169,7 +319,7 @@ static void usb_rx_task(void *params) {
             } else {
                 uint16_t sample = ((uint16_t)(uint8_t)c << 8) | lsb;
                 if (sample > PWM_WRAP) sample = PWM_WRAP;
-                xQueueSend(xQueueSpkSamples, &sample, 0);
+                spk_ring_push(sample);
                 have_lsb = false;
             }
         }
@@ -180,11 +330,11 @@ int main(void) {
     stdio_init_all();
     sleep_ms(2000);
 
-    xQueueSpkSamples = xQueueCreate(4096, sizeof(uint16_t));
+    // Reprodução é dirigida por ISR do PWM (não por task) — inicializa aqui.
+    spk_audio_init();
 
     xTaskCreate(button_task, "btn", 1024, NULL, 3, NULL);
     xTaskCreate(mic_task,    "mic", 1024, NULL, 2, NULL);
-    xTaskCreate(spk_task,    "spk", 1024, NULL, 2, NULL);
     xTaskCreate(usb_rx_task, "rx",  2048, NULL, 2, NULL);
 
     vTaskStartScheduler();
