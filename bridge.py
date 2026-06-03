@@ -108,6 +108,19 @@ def process_for_wav(samples_u12: np.ndarray) -> np.ndarray:
     return s.astype(np.int16)
 
 
+def process_raw(samples_u12: np.ndarray) -> np.ndarray:
+    """
+    Só remove DC e normaliza — SEM filtro nenhum. Mostra o sinal cru do ADC,
+    pra separar problema de captura (hardware/ADC) de problema de DSP/filtro.
+    """
+    s = samples_u12.astype(np.float32)
+    s -= s.mean()
+    peak = np.max(np.abs(s)) if len(s) else 0.0
+    if peak > 1.0:
+        s *= 32767.0 * 0.9 / peak
+    return s.astype(np.int16)
+
+
 def process_for_playback(samples_u12: np.ndarray) -> np.ndarray:
     """
     Remove DC, aplica filtro de voz, normaliza, retorna formato 12-bit centrado em PWM_MID.
@@ -123,15 +136,15 @@ def process_for_playback(samples_u12: np.ndarray) -> np.ndarray:
     return s.astype(np.uint16)
 
 
-def save_wav(samples_int16: np.ndarray, path: Path):
+def save_wav(samples_int16: np.ndarray, path: Path, rate: int = SAMPLE_RATE):
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)              # 16-bit
-        wf.setframerate(SAMPLE_RATE)
+        wf.setframerate(rate)
         wf.writeframes(samples_int16.tobytes())
-    duration = len(samples_int16) / SAMPLE_RATE
-    print(f"  ↳ salvo: {path} ({len(samples_int16)} samples, {duration:.2f}s)")
+    duration = len(samples_int16) / rate
+    print(f"  ↳ salvo: {path} ({len(samples_int16)} samples, {duration:.2f}s @ {rate} Hz)")
 
 
 def play_back(ser: serial.Serial, samples_u12: np.ndarray):
@@ -154,6 +167,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="porta serial do Pico (ex: COM3)")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--no-play", action="store_true",
+                    help="não reproduz no speaker — teste só de captura")
     args = ap.parse_args()
 
     if not args.port:
@@ -171,6 +186,7 @@ def main():
     buffer = bytearray()
     window = bytearray(b"\x00\x00\x00\x00")
     rec_idx = 1
+    t_start = 0.0
 
     try:
         while True:
@@ -188,20 +204,56 @@ def main():
                     if state == "idle":
                         print(f"[{rec_idx}] Gravando...")
                         buffer.clear()
+                        t_start = time.time()
                         state = "recording"
                 elif bytes(window) == RECV_REC_END:
                     if state == "recording":
+                        elapsed = time.time() - t_start
                         # Os últimos 3 bytes salvos no buffer eram parte do "<<E>"
                         if len(buffer) >= 3:
                             del buffer[-3:]
 
-                        samples_u12 = parse_samples_12bit(bytes(buffer))
-                        print(f"[{rec_idx}] Fim ({len(samples_u12)} samples)")
+                        raw_bytes = bytes(buffer)
+                        samples_u12 = parse_samples_12bit(raw_bytes)
+                        n = len(samples_u12)
+                        eff_rate = n / elapsed if elapsed > 0 else 0.0
 
-                        wav_path = RECORDINGS_DIR / f"rec_{rec_idx:03d}.wav"
-                        save_wav(process_for_wav(samples_u12), wav_path)
+                        # ---- Diagnóstico de captura ----
+                        if n:
+                            dc = float(samples_u12.mean())
+                            smin, smax = int(samples_u12.min()), int(samples_u12.max())
+                        else:
+                            dc, smin, smax = 0.0, 0, 0
+                        print(f"[{rec_idx}] Fim: {n} samples em {elapsed:.2f}s")
+                        print(f"      taxa real  ≈ {eff_rate:.0f} Hz   (firmware deveria dar {SAMPLE_RATE})")
+                        print(f"      ADC dc={dc:.0f} (~{dc/4095*3.3:.2f} V)  min={smin}  max={smax}  span={smax-smin}")
 
-                        play_back(ser, process_for_playback(samples_u12))
+                        # ---- Análise de alinhamento ----
+                        # No formato certo, todo byte MSB (índice ímpar) é <= 0x0F (12-bit).
+                        def bad_msb_frac(bs, off):
+                            m = len(bs) - off
+                            arr = np.frombuffer(bs[off:off + 2 * (m // 2)], dtype=np.uint8)
+                            msb = arr[1::2]
+                            return (msb > 0x0F).mean() * 100 if len(msb) else 100.0
+                        print(f"      bytes[0:24] = {raw_bytes[:24].hex(' ')}")
+                        print(f"      len(buffer)={len(raw_bytes)} (par? {len(raw_bytes) % 2 == 0})")
+                        print(f"      MSB>0x0F:  alinh.0 = {bad_msb_frac(raw_bytes, 0):.1f}%   "
+                              f"alinh.+1 = {bad_msb_frac(raw_bytes, 1):.1f}%")
+                        if smax - smin < 50:
+                            print("      ⚠ span baixíssimo — ADC quase parado (mic mudo / pino errado / sem sinal)")
+                        if smin == 0 and smax >= 4094:
+                            print("      ⚠ saturando 0..4095 — clipping / ganho alto demais / pino flutuando")
+
+                        # WAV CRU (sem filtro) na taxa REAL medida -> pitch correto, mostra o ADC puro
+                        raw_rate = int(round(eff_rate)) if eff_rate > 1000 else SAMPLE_RATE
+                        save_wav(process_raw(samples_u12),
+                                 RECORDINGS_DIR / f"raw_{rec_idx:03d}.wav", rate=raw_rate)
+                        # WAV filtrado (como antes), na taxa nominal
+                        save_wav(process_for_wav(samples_u12),
+                                 RECORDINGS_DIR / f"rec_{rec_idx:03d}.wav")
+
+                        if not args.no_play:
+                            play_back(ser, process_for_playback(samples_u12))
 
                         rec_idx += 1
                         state = "idle"
