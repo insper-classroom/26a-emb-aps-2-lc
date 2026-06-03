@@ -18,17 +18,15 @@ target_include_directories(pico_emb PRIVATE
 # Linking to FreeRTOS-Kernel-Heap4 means we use a dynamic heap for allocations
 target_link_libraries(${PROJECT_NAME}
     pico_stdlib
-    # hardware_adc
-    # hardware_dma
-    # hardware_pwm
-    # FreeRTOS-Kernel
-    # FreeRTOS-Kernel-Heap4
-     hardware_dma
+    FreeRTOS-Kernel
+    FreeRTOS-Kernel-Heap4
+    hardware_dma
     hardware_pio
     hardware_timer
     hardware_clocks
     hardware_pwm
-    
+    hardware_adc
+    hardware_irq
 )
 # Set the nunber of cores to 1.
 # This defaults to 2 in FreeRTOSConfig_examples_common.h if not defined in here
@@ -46,8 +44,8 @@ if(PICO_CYW43_SUPPORTED)
 endif()
 # Áudio (16 kHz x 16-bit = 32 KB/s) NÃO cabe na UART de 115200 baud (~11.5 KB/s).
 # Manda stdio pelo USB CDC nativo (~12 Mbps) e desliga a UART.
-pico_enable_stdio_usb(pico_emb 0)
-pico_enable_stdio_uart(pico_emb 1)
+pico_enable_stdio_usb(pico_emb 1)
+pico_enable_stdio_uart(pico_emb 0)
 
 pico_add_extra_outputs(pico_emb)
 

@@ -24,10 +24,10 @@ Raspberry Pi Pico 2 conectado por USB a um PC. O usuário aperta um botão, fala
 
 | | Componente | Pino |
 |---|---|---|
-| Input | Microfone MAX9814 | GP26 (ADC0) |
-| Input | Botão push-to-talk | GP14 |
-| Output | Speaker (PWM + filtro RC + TPA2012) | GP15 |
-| Output | LED de status | GP25 |
+| Input | Microfone MAX9814 | GP28 (ADC2) |
+| Input | Botão push-to-talk | GP3 |
+| Output | Speaker (PWM + filtro RC + TPA2012) | GP26 |
+| Output | LED de status | GP4 |
 
 ## Protocolo
 
