@@ -326,6 +326,21 @@ static void usb_rx_task(void *params) {
     }
 }
 
+// Mantém o TinyUSB vivo sob o FreeRTOS. O servicing por timer/IRQ do stdio_usb
+// não dispara de forma confiável depois que o scheduler assume, então o tud_task()
+// para e os control-transfers (SET_LINE_CODING ao abrir a porta) ficam sem resposta
+// -> WinError 31 no PC. Aqui o próprio scheduler (que comprovadamente roda) chama
+// stdio_flush() a cada 1 ms, e ele invoca tud_task() pelo caminho serializado
+// (sob o mutex do stdio_usb), sem reentrância. Prioridade alta pra responder o
+// host rápido; cede a CPU a cada tick.
+static void usb_service_task(void *params) {
+    (void) params;
+    while (true) {
+        stdio_flush();
+        vTaskDelay(1);   // 1 tick = 1 ms (configTICK_RATE_HZ = 1000)
+    }
+}
+
 int main(void) {
     stdio_init_all();
     sleep_ms(2000);
@@ -333,9 +348,10 @@ int main(void) {
     // Reprodução é dirigida por ISR do PWM (não por task) — inicializa aqui.
     spk_audio_init();
 
-    xTaskCreate(button_task, "btn", 1024, NULL, 3, NULL);
-    xTaskCreate(mic_task,    "mic", 1024, NULL, 2, NULL);
-    xTaskCreate(usb_rx_task, "rx",  2048, NULL, 2, NULL);
+    xTaskCreate(usb_service_task, "usb", 1024, NULL, 4, NULL);
+    xTaskCreate(button_task,      "btn", 1024, NULL, 3, NULL);
+    xTaskCreate(mic_task,         "mic", 1024, NULL, 2, NULL);
+    xTaskCreate(usb_rx_task,      "rx",  2048, NULL, 2, NULL);
 
     vTaskStartScheduler();
     while (true) { }

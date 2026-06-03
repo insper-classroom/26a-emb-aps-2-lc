@@ -1,2 +1,7 @@
 build
 !.vscode/*
+
+# Segredos — NUNCA commitar a chave da OpenAI
+.env
+__pycache__/
+recordings/

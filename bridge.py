@@ -7,6 +7,7 @@ Uso:
 """
 
 import argparse
+import os
 import struct
 import sys
 import time
@@ -17,6 +18,17 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 from scipy import signal as scipy_signal
+
+try:
+    from openai import OpenAI          # só necessário no modo chat
+except ImportError:
+    OpenAI = None
+
+try:
+    from dotenv import load_dotenv     # carrega OPENAI_API_KEY do arquivo .env
+    load_dotenv()
+except ImportError:
+    pass
 
 
 SAMPLE_RATE = 16000
@@ -36,6 +48,23 @@ SEND_PLAY_START = b"<<P>"
 SEND_PLAY_END   = b"<<X>"
 RECV_REC_START  = b"<<S>"
 RECV_REC_END    = b"<<E>"
+
+# ---------- Pipeline de IA (Whisper -> GPT -> TTS) ----------
+TRANSCRIBE_MODEL = "whisper-1"
+CHAT_MODEL       = "gpt-4o-mini"
+TTS_MODEL        = "gpt-4o-mini-tts"  # bem mais natural/humano que o tts-1
+TTS_VOICE        = "coral"            # alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer
+TTS_PCM_RATE     = 24000              # TTS em pcm sai a 24 kHz, 16-bit, mono
+TTS_INSTRUCTIONS = (                  # só o gpt-4o-mini-tts usa isto (steer de tom)
+    "Fale em português do Brasil de forma natural, calorosa e conversacional, "
+    "como uma pessoa real numa conversa — ritmo tranquilo e entonação expressiva."
+)
+
+SYSTEM_PROMPT = (
+    "Você é um assistente de voz embarcado num controle físico. "
+    "Responda em português do Brasil, de forma curta e direta — no máximo 2 ou 3 "
+    "frases, sem listas nem markdown, porque a resposta será lida em voz alta."
+)
 
 
 def list_ports():
@@ -130,7 +159,7 @@ def process_for_playback(samples_u12: np.ndarray) -> np.ndarray:
     s = filter_voice(s)
     peak = np.max(np.abs(s))
     if peak > 1.0:
-        s *= (PWM_MID * 0.9) / peak
+        s *= (PWM_MID * 0.97) / peak
     s += PWM_MID
     s = np.clip(s, 0, PWM_WRAP)
     return s.astype(np.uint16)
@@ -147,39 +176,160 @@ def save_wav(samples_int16: np.ndarray, path: Path, rate: int = SAMPLE_RATE):
     print(f"  ↳ salvo: {path} ({len(samples_int16)} samples, {duration:.2f}s @ {rate} Hz)")
 
 
+PLAY_PRIME_SAMPLES = 3072    # cushion pré-enviado antes de marcar o tempo (~192 ms)
+PLAY_CHUNK_SAMPLES = 512     # 1 KB por write (~32 ms). Ring do firmware = 8192.
+
+
 def play_back(ser: serial.Serial, samples_u12: np.ndarray):
-    print(f"  ↳ tocando de volta ({len(samples_u12)} samples)...")
-    # Empacota em little-endian: 2 bytes por sample
+    """
+    Toca no speaker sem picotar. O ring do firmware (~0.5 s) seca se a gente apenas
+    der sleeps fixos por chunk — no Windows o time.sleep tem granularidade de ~15 ms
+    e atrasa os envios, esvaziando o ring (underrun = "picotado").
+
+    Solução: (1) pré-enche um 'prime' de samples como cushion e (2) envia o resto
+    ancorado em tempo ABSOLUTO (perf_counter), então a jitter do sleep não acumula
+    e o ring fica sempre ~PRIME cheio.
+    """
+    n = len(samples_u12)
+    print(f"  ↳ tocando de volta ({n} samples, {n / SAMPLE_RATE:.1f}s)...")
     raw = samples_u12.astype("<u2").tobytes()
 
     ser.write(SEND_PLAY_START)
-    chunk = 512
-    for i in range(0, len(raw), chunk):
-        ser.write(raw[i:i+chunk])
-        # cada chunk de 512 bytes = 256 samples = 16ms @ 16kHz
-        time.sleep((chunk // 2) / SAMPLE_RATE)
+
+    # 1) pré-enche o ring antes de começar a contar o tempo
+    ser.write(raw[:PLAY_PRIME_SAMPLES * 2])
+
+    # 2) envia o resto em ritmo real, ancorado em t0
+    t0 = time.perf_counter()
+    sent = PLAY_PRIME_SAMPLES
+    pos = PLAY_PRIME_SAMPLES * 2
+    while pos < len(raw):
+        block = raw[pos:pos + PLAY_CHUNK_SAMPLES * 2]
+        ser.write(block)
+        pos += len(block)
+        sent += len(block) // 2
+        # espera até o instante em que (sent - PRIME) samples já deveriam ter tocado
+        target = t0 + (sent - PLAY_PRIME_SAMPLES) / SAMPLE_RATE
+        dt = target - time.perf_counter()
+        if dt > 0:
+            time.sleep(dt)
+
     ser.write(SEND_PLAY_END)
     ser.flush()
     print("  ↳ playback enviado")
 
 
+def transcribe(client: "OpenAI", wav_path: Path) -> str:
+    """Whisper: WAV -> texto (pt)."""
+    with open(wav_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model=TRANSCRIBE_MODEL, file=f, language="pt", response_format="text",
+        )
+    return result.strip() if isinstance(result, str) else result.text.strip()
+
+
+def chat_reply(client: "OpenAI", history: list, user_text: str) -> str:
+    """GPT: mantém o histórico da conversa e devolve a resposta."""
+    history.append({"role": "user", "content": user_text})
+    resp = client.chat.completions.create(model=CHAT_MODEL, messages=history)
+    answer = resp.choices[0].message.content.strip()
+    history.append({"role": "assistant", "content": answer})
+    return answer
+
+
+def synthesize_to_u12(client: "OpenAI", text: str, voice: str) -> np.ndarray:
+    """TTS -> samples 12-bit (0..PWM_WRAP) a 16 kHz, prontos pro play_back()."""
+    with client.audio.speech.with_streaming_response.create(
+        model=TTS_MODEL, voice=voice, input=text, response_format="pcm",
+        instructions=TTS_INSTRUCTIONS,
+    ) as resp:
+        pcm = resp.read()                       # int16 LE mono @ 24 kHz
+
+    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    # 24 kHz -> 16 kHz (mesma taxa que o firmware espera)
+    audio = scipy_signal.resample_poly(audio, SAMPLE_RATE, TTS_PCM_RATE)
+    # int16 centrado em 0 -> 12-bit centrado em PWM_MID
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak > 1.0:
+        audio *= (PWM_MID * 0.97) / peak
+    audio += PWM_MID
+    audio = np.clip(audio, 0, PWM_WRAP)
+    return audio.astype(np.uint16)
+
+
+def run_chat_pipeline(client: "OpenAI", history: list, wav_path: Path,
+                      ser: serial.Serial, voice: str):
+    """Whisper -> GPT -> TTS -> speaker. Erros em qualquer etapa abortam só o turno."""
+    try:
+        text = transcribe(client, wav_path)
+    except Exception as e:
+        print(f"  ↳ ERRO transcrição: {e}")
+        return
+    print(f"  🗣  você: {text!r}")
+    if not text.strip():
+        print("  ↳ (transcrição vazia, ignorando)")
+        return
+
+    try:
+        answer = chat_reply(client, history, text)
+    except Exception as e:
+        print(f"  ↳ ERRO GPT: {e}")
+        return
+    print(f"  🤖 GPT: {answer!r}")
+
+    try:
+        u12 = synthesize_to_u12(client, answer, voice)
+    except Exception as e:
+        print(f"  ↳ ERRO TTS: {e}")
+        return
+    play_back(ser, u12)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="porta serial do Pico (ex: COM3)")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, default=460800,
+                    help="deve casar com PICO_DEFAULT_UART_BAUD_RATE do firmware (460800)")
+    ap.add_argument("--mode", choices=["chat", "echo"], default="chat",
+                    help="chat = Whisper→GPT→TTS (padrão); echo = toca o próprio áudio")
+    ap.add_argument("--voice", default=TTS_VOICE,
+                    help="voz do TTS (alloy, echo, fable, onyx, nova, shimmer)")
     ap.add_argument("--no-play", action="store_true",
-                    help="não reproduz no speaker — teste só de captura")
+                    help="no modo echo, não reproduz — teste só de captura")
     args = ap.parse_args()
+
+    # No Windows o time.sleep tem granularidade de ~15 ms por padrão, o que faz o
+    # pacing do playback engasgar. Eleva a resolução do timer pra ~1 ms.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
 
     if not args.port:
         list_ports()
         sys.exit("\nUse: python bridge.py --port <porta>")
+
+    client = None
+    history = None
+    if args.mode == "chat":
+        if OpenAI is None:
+            sys.exit("Modo chat precisa do pacote openai:  pip install openai")
+        if not os.getenv("OPENAI_API_KEY"):
+            sys.exit('Defina OPENAI_API_KEY (PowerShell: $env:OPENAI_API_KEY="sk-...").')
+        client = OpenAI()
+        history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     print(f"Abrindo {args.port}...")
     ser = serial.Serial(args.port, args.baud, timeout=0.1)
     time.sleep(2)
     ser.reset_input_buffer()
 
+    if args.mode == "chat":
+        print(f"Modo CHAT — Whisper → {CHAT_MODEL} → TTS({args.voice}).")
+    else:
+        print("Modo ECHO — toca de volta o próprio áudio.")
     print("Conectado. Aperte o botão no Pico pra gravar.\n")
 
     state = "idle"
@@ -252,7 +402,12 @@ def main():
                         save_wav(process_for_wav(samples_u12),
                                  RECORDINGS_DIR / f"rec_{rec_idx:03d}.wav")
 
-                        if not args.no_play:
+                        if args.mode == "chat":
+                            run_chat_pipeline(
+                                client, history,
+                                RECORDINGS_DIR / f"rec_{rec_idx:03d}.wav",
+                                ser, args.voice)
+                        elif not args.no_play:
                             play_back(ser, process_for_playback(samples_u12))
 
                         rec_idx += 1
