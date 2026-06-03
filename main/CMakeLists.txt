@@ -16,11 +16,13 @@ target_include_directories(pico_emb PRIVATE
     )
 
 # Linking to FreeRTOS-Kernel-Heap4 means we use a dynamic heap for allocations
-target_link_libraries(pico_emb PRIVATE
-    pico_async_context_freertos
-    FreeRTOS-Kernel-Heap4
+target_link_libraries(${PROJECT_NAME}
     pico_stdlib
-    )
+    hardware_adc
+    hardware_pwm
+    FreeRTOS-Kernel
+    FreeRTOS-Kernel-Heap4
+)
 # Set the nunber of cores to 1.
 # This defaults to 2 in FreeRTOSConfig_examples_common.h if not defined in here
 target_compile_definitions(pico_emb PRIVATE

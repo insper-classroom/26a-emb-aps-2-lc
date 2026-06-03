@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 360" role="img" aria-label="Diagrama de blocos do firmware voice-bridge">
+  <title>Diagrama de blocos do firmware</title>
+  <desc>Tasks, ISRs e recursos externos do firmware voice-bridge sobre FreeRTOS.</desc>
+  <style>
+    .label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 12px; }
+    .ext   { fill: #F1EFE8; stroke: #5F5E5A; }
+    .ext-t { fill: #2C2C2A; }
+    .isr   { fill: #EEEDFE; stroke: #534AB7; }
+    .isr-t { fill: #26215C; }
+    .task  { fill: #E6F1FB; stroke: #185FA5; }
+    .task-t{ fill: #042C53; }
+    .edge  { fill: none; stroke: #5F5E5A; stroke-width: 1.5; }
+    .edge-t{ fill: #5F5E5A; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- captura: botão -->
+  <polygon class="ext" points="40,90 100,70 160,90 100,110" stroke-width="0.5"/>
+  <text class="label ext-t" x="100" y="92" text-anchor="middle" dominant-baseline="central">botão</text>
+
+  <ellipse class="isr" cx="260" cy="90" rx="55" ry="22" stroke-width="0.5"/>
+  <text class="label isr-t" x="260" y="92" text-anchor="middle" dominant-baseline="central">btn_isr</text>
+
+  <rect class="task" x="400" y="68" width="120" height="44" rx="6" stroke-width="0.5"/>
+  <text class="label task-t" x="460" y="92" text-anchor="middle" dominant-baseline="central">usb_task</text>
+
+  <polygon class="ext" points="560,68 640,68 640,112 560,112" stroke-width="0.5"/>
+  <text class="label ext-t" x="600" y="92" text-anchor="middle" dominant-baseline="central">PC (USB)</text>
+
+  <line x1="160" y1="90" x2="205" y2="90" class="edge" marker-end="url(#arrow)"/>
+  <line x1="315" y1="90" x2="398" y2="90" class="edge" marker-end="url(#arrow)"/>
+  <text class="label edge-t" x="356" y="82" text-anchor="middle">xSemBtn</text>
+  <line x1="520" y1="90" x2="558" y2="90" class="edge" marker-end="url(#arrow)"/>
+
+  <!-- captura: microfone -->
+  <polygon class="ext" points="40,200 100,180 160,200 100,220" stroke-width="0.5"/>
+  <text class="label ext-t" x="100" y="202" text-anchor="middle" dominant-baseline="central">microfone</text>
+
+  <ellipse class="isr" cx="260" cy="200" rx="55" ry="22" stroke-width="0.5"/>
+  <text class="label isr-t" x="260" y="202" text-anchor="middle" dominant-baseline="central">adc_isr</text>
+
+  <line x1="160" y1="200" x2="205" y2="200" class="edge" marker-end="url(#arrow)"/>
+  <path d="M315 200 L380 200 L380 112" class="edge" marker-end="url(#arrow)"/>
+  <text class="label edge-t" x="348" y="192" text-anchor="middle">xQueueMic</text>
+
+  <!-- reprodução -->
+  <rect class="task" x="400" y="270" width="120" height="44" rx="6" stroke-width="0.5"/>
+  <text class="label task-t" x="460" y="294" text-anchor="middle" dominant-baseline="central">spk_task</text>
+
+  <ellipse class="isr" cx="260" cy="292" rx="55" ry="22" stroke-width="0.5"/>
+  <text class="label isr-t" x="260" y="294" text-anchor="middle" dominant-baseline="central">pwm_isr</text>
+
+  <polygon class="ext" points="40,292 100,272 160,292 100,312" stroke-width="0.5"/>
+  <text class="label ext-t" x="100" y="294" text-anchor="middle" dominant-baseline="central">speaker</text>
+
+  <path d="M600 112 L600 292 L522 292" class="edge" marker-end="url(#arrow)"/>
+  <line x1="398" y1="292" x2="318" y2="292" class="edge" marker-end="url(#arrow)"/>
+  <text class="label edge-t" x="358" y="284" text-anchor="middle">xQueueSpk</text>
+  <line x1="205" y1="292" x2="160" y2="292" class="edge" marker-end="url(#arrow)"/>
+
+  <!-- legenda -->
+  <rect x="40" y="335" width="14" height="14" class="ext" stroke-width="0.5"/>
+  <text class="label ext-t" x="60" y="346" dominant-baseline="central">recurso externo</text>
+  <ellipse cx="200" cy="342" rx="14" ry="7" class="isr" stroke-width="0.5"/>
+  <text class="label ext-t" x="222" y="346" dominant-baseline="central">ISR</text>
+  <rect x="290" y="335" width="14" height="14" rx="3" class="task" stroke-width="0.5"/>
+  <text class="label ext-t" x="310" y="346" dominant-baseline="central">task</text>
+  <line x1="370" y1="342" x2="400" y2="342" class="edge" marker-end="url(#arrow)"/>
+  <text class="label ext-t" x="408" y="346" dominant-baseline="central">fila / semáforo</text>
+</svg>
