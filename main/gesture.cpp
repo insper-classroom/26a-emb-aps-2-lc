@@ -19,11 +19,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-// Estado do áudio (definido em main.c). Só emite o gesto quando ambos false.
-extern "C" {
-    extern volatile bool recording;
-    extern volatile bool playing;
-}
+// Estado do áudio (definido em main.c). Só emite o gesto quando o áudio está ocioso.
+extern "C" bool audio_is_busy(void);
 
 // --- IMU / I2C ---
 #define IMU_I2C            i2c0
@@ -78,7 +75,7 @@ extern "C" void imu_task(void *params) {
 
     while (true) {
         // Áudio tem prioridade: enquanto grava/toca, não mede (descarta a janela).
-        if (recording || playing) {
+        if (audio_is_busy()) {
             window_reset(amin, amax, asum, &count);
             vTaskDelay(pdMS_TO_TICKS(IMU_SAMPLE_MS));
             continue;
@@ -113,7 +110,7 @@ extern "C" void imu_task(void *params) {
                           (p2p[grav] >= p2p[(grav + 1) % 3]) &&
                           (p2p[grav] >= p2p[(grav + 2) % 3]);
 
-            if (updown && !recording && !playing && xTaskGetTickCount() >= cooldown_until) {
+            if (updown && !audio_is_busy() && xTaskGetTickCount() >= cooldown_until) {
                 fwrite("<<U>", 1, 4, stdout);
                 fflush(stdout);
                 cooldown_until = xTaskGetTickCount() + pdMS_TO_TICKS(GESTURE_COOLDOWN_MS);
