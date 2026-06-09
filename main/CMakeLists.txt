@@ -9,6 +9,7 @@ include(FreeRTOS_Kernel_import.cmake)
 # Áudio (main.c) + heurística de gesto do IMU (gesture.cpp). Sem Edge Impulse.
 add_executable(pico_emb
     main.c
+    audio.c
     gesture.cpp
     )
 
