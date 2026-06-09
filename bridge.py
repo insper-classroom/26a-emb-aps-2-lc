@@ -48,6 +48,15 @@ SEND_PLAY_START = b"<<P>"
 SEND_PLAY_END   = b"<<X>"
 RECV_REC_START  = b"<<S>"
 RECV_REC_END    = b"<<E>"
+RECV_GESTURE_UPDOWN = b"<<U>"   # Pico detectou o gesto "updown" no IMU
+
+# Instrução usada quando o usuário pede (gesto updown) uma resposta diferente.
+ALT_INSTRUCTION = (
+    "Pelo gesto, o usuário não gostou da resposta anterior e quer outra. "
+    "Responda de novo à última pergunta dele, mas com uma resposta ALTERNATIVA: "
+    "outra abordagem, ângulo ou exemplo, sem repetir o que você já disse. "
+    "Continue curto e direto, no máximo 2 ou 3 frases."
+)
 
 # ---------- Pipeline de IA (Whisper -> GPT -> TTS) ----------
 TRANSCRIBE_MODEL = "whisper-1"
@@ -285,6 +294,27 @@ def run_chat_pipeline(client: "OpenAI", history: list, wav_path: Path,
     play_back(ser, u12)
 
 
+def regenerate_alternative(client: "OpenAI", history: list, ser: serial.Serial, voice: str):
+    """Gesto updown: refaz a última pergunta com uma resposta diferente -> TTS -> speaker."""
+    # Precisa de pelo menos system + 1 pergunta + 1 resposta no histórico.
+    if not history or len(history) < 3:
+        print("  ↩ updown: ainda não há pergunta anterior pra refazer.")
+        return
+    print("  ↩ updown detectado — gerando resposta alternativa...")
+    try:
+        answer = chat_reply(client, history, ALT_INSTRUCTION)
+    except Exception as e:
+        print(f"  ↳ ERRO GPT (alternativa): {e}")
+        return
+    print(f"  🤖 GPT (alternativa): {answer!r}")
+    try:
+        u12 = synthesize_to_u12(client, answer, voice)
+    except Exception as e:
+        print(f"  ↳ ERRO TTS (alternativa): {e}")
+        return
+    play_back(ser, u12)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="porta serial do Pico (ex: COM3)")
@@ -337,6 +367,7 @@ def main():
     window = bytearray(b"\x00\x00\x00\x00")
     rec_idx = 1
     t_start = 0.0
+    last_gesture_t = 0.0   # anti-repique do gesto updown
 
     try:
         while True:
@@ -412,6 +443,12 @@ def main():
 
                         rec_idx += 1
                         state = "idle"
+                elif bytes(window) == RECV_GESTURE_UPDOWN:
+                    # Gesto só vale em estado ocioso e no modo chat. Anti-repique de 2 s
+                    # (o firmware já tem cooldown próprio de 3 s).
+                    if state == "idle" and args.mode == "chat" and (time.time() - last_gesture_t) > 2.0:
+                        last_gesture_t = time.time()
+                        regenerate_alternative(client, history, ser, args.voice)
                 elif state == "recording":
                     buffer.append(byte)
 

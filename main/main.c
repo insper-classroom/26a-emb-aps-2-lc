@@ -29,7 +29,7 @@
 #include "task.h"
 
 #define PIN_BTN    3
-#define PIN_LED    4
+#define PIN_LED   15   // LED movido do GP4 (agora ocupado pelo IMU/SDA) pro GP15
 #define PIN_MIC   28   // GP28 = ADC2
 #define PIN_SPK   26   // PWM
 #define ADC_CHAN   2
@@ -59,8 +59,13 @@
 #define SPK_RING_SIZE    8192          // potência de 2; ~0.5 s @ 16 kHz
 #define SPK_RING_MASK    (SPK_RING_SIZE - 1)
 
-static volatile bool recording = false;
-static volatile bool playing   = false;
+// Globais (sem static): a gesture.cpp lê estes flags pra só emitir o gesto quando
+// o controle está ocioso, sem injetar bytes no meio do stream de áudio.
+volatile bool recording = false;
+volatile bool playing   = false;
+
+// Task de reconhecimento de gestos do IMU (definida em gesture.cpp).
+extern void imu_task(void *params);
 
 // --- Captura do microfone via DMA ---
 static uint16_t mic_buf[2][MIC_CHUNK];   // ping-pong
@@ -352,6 +357,8 @@ int main(void) {
     xTaskCreate(button_task,      "btn", 1024, NULL, 3, NULL);
     xTaskCreate(mic_task,         "mic", 1024, NULL, 2, NULL);
     xTaskCreate(usb_rx_task,      "rx",  2048, NULL, 2, NULL);
+    // Heurística de gesto do IMU: prioridade 1 (mais baixa), stack pequena (sem EI).
+    xTaskCreate(imu_task,         "imu", 2048, NULL, 1, NULL);
 
     vTaskStartScheduler();
     while (true) { }
